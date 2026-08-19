@@ -35,12 +35,31 @@ NOTIFICATION_TEST_PARAM = "vpp_notification_test"
 NOTIFICATION_TEST_VALUE = "true"
 NOTIFICATION_TIMEOUT = 5.0
 NOTIFICATION_POLL_INTERVAL = 0.5
+# RFC 5880 holds the control-packet interval at one second until a session is
+# up, so a fresh BFD session needs several round trips before it transitions.
+# Measured bring-up against the scapy responder is around 5.5s, on top of which
+# the notification still has to clear the VPP event poll.
+BFD_NOTIFICATION_TIMEOUT = 25.0
+# vppProcessEvents() sleeps this long between drains of the VPP event queue, so
+# link changes made just before a test starts can still be in flight.
+VPP_EVENT_POLL_SECONDS = 2.0
+VPPCTL_TIMEOUT = 10
+BFD_EPHEMERAL_SRC_PORT = 49152
+BFD_STATE_INIT = 2
+BFD_STATE_UP = 3
+# A scapy responder cannot sustain a sub-second reply cadence reliably, and at
+# the SAI default the negotiated interval drops the session within 300ms of a
+# missed reply. One second with a multiplier of three keeps the session stable
+# while still detecting a broken path in about three seconds.
+BFD_INTERVAL_USEC = 1000000
+BFD_MULTIPLIER = 3
 
 
 class NotificationTestBase(T0TestBase):
     """Common setup for the opt-in server-owned notification bridge."""
 
     def setUp(self, **kwargs):
+        self.pending_events = []
         params = test_params_get() or {}
         if params.get(NOTIFICATION_TEST_PARAM) != NOTIFICATION_TEST_VALUE:
             super().setUp(skip_reason="VPP notification tests are opt-in")
@@ -49,23 +68,48 @@ class NotificationTestBase(T0TestBase):
         T0TestBase.setUp(self, **kwargs)
         status = self.client.sai_thrift_enable_notifications()
         self.assertEqual(status, SAI_STATUS_SUCCESS)
-        self.client.sai_thrift_drain_notifications()
+        self.discard_pending_notifications()
 
     def tearDown(self):
         try:
             if self.client is not None:
-                self.client.sai_thrift_drain_notifications()
+                self.discard_pending_notifications()
         finally:
             super().tearDown()
 
-    def wait_for_notification(self, predicate):
-        deadline = time.monotonic() + NOTIFICATION_TIMEOUT
-        while time.monotonic() < deadline:
-            for event in self.client.sai_thrift_drain_notifications():
+    def discard_pending_notifications(self):
+        self.pending_events = []
+        self.client.sai_thrift_drain_notifications()
+
+    def wait_for_notification(self, predicate, timeout=NOTIFICATION_TIMEOUT):
+        """Return the first queued event matching predicate, keeping the rest.
+
+        Events the caller is not waiting for yet are retained so that a drain
+        which returns several transitions at once cannot lose the one a later
+        assertion depends on.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            for index, event in enumerate(self.pending_events):
                 if predicate(event):
-                    return event
+                    return self.pending_events.pop(index)
+
+            if time.monotonic() >= deadline:
+                break
+
+            self.pending_events.extend(
+                self.client.sai_thrift_drain_notifications()
+            )
             time.sleep(NOTIFICATION_POLL_INTERVAL)
-        self.fail("timed out waiting for the expected SAI notification")
+
+        self.fail(
+            "timed out waiting for the expected SAI notification; observed {}".format(
+                [
+                    (event.notification_type, hex(event.object_id), event.state)
+                    for event in self.pending_events
+                ]
+            )
+        )
 
     @staticmethod
     def peer_interface(port_index):
@@ -90,16 +134,52 @@ class NotificationTestBase(T0TestBase):
         return "OEthernet{}".format(match.group(1))
 
     @staticmethod
-    def set_peer_state(interface_name, is_up):
+    def vpp_hwif_name(vpp_interface_name):
+        return "host-{}".format(vpp_interface_name)
+
+    @staticmethod
+    def set_link_state(interface_name, is_up):
         state = "up" if is_up else "down"
         subprocess.run(
             ["ip", "link", "set", "dev", interface_name, state],
             check=True,
         )
 
+    @staticmethod
+    def vppctl(*command):
+        """Return combined vppctl output, used as dataplane-side evidence.
+
+        Reading VPP directly keeps the assertions independent of the SAI object
+        that the notification itself updates.
+        """
+        result = subprocess.run(
+            ["vppctl"] + list(command),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=VPPCTL_TIMEOUT,
+        )
+        return result.stdout.decode("utf-8", "replace")
+
+    def log_vpp_state(self, *command):
+        output = self.vppctl(*command)
+        print("vppctl {}:\n{}".format(" ".join(command), output))
+        return output
+
 
 class PortNotificationTestBase(NotificationTestBase):
-    """Port notification setup without unrelated L3 configuration."""
+    """Port notification setup without unrelated L3 configuration.
+
+    The link is flapped on the SAI host-interface netdev rather than on the
+    wire-side ``OEth<N>_peer``. VPP binds ``host-OEthernet<N>`` with an
+    AF_PACKET socket, and that driver does not watch the underlying netdev's
+    carrier: downing the veth peer leaves Linux reporting NO-CARRIER while
+    ``vppctl show hardware-interfaces`` still reports the link up, so no
+    ``sw_interface_event`` is ever raised and no notification can follow.
+    Downing the host-interface netdev is still the HLD's ``ip link set down``
+    stimulus, and linux-cp propagates it to the paired hardware interface,
+    which does raise the asynchronous VPP event under test.
+    """
 
     def setUp(self):
         super().setUp(
@@ -114,75 +194,94 @@ class PortNotificationTestBase(NotificationTestBase):
             wait_sec=1,
         )
         self.port = self.dut.port_obj_list[0]
-        self.peer = self.peer_interface(self.port.dev_port_index)
-        self.vpp_peer = self.vpp_interface(self.peer)
-        self.set_peer_state(self.peer, True)
-        self.set_peer_state(self.vpp_peer, True)
-        self.client.sai_thrift_drain_notifications()
+        self.hostif_dev = self.port.config.name
+        self.vpp_hwif = self.vpp_hwif_name(
+            self.vpp_interface(self.peer_interface(self.port.dev_port_index))
+        )
+        self.set_link_state(self.hostif_dev, True)
+        # Let the link-up events raised above reach the queue before the
+        # discard, otherwise they surface mid-test and the port looks flappy.
+        time.sleep(VPP_EVENT_POLL_SECONDS * 2)
+        self.discard_pending_notifications()
 
     def port_event(self, state):
-        return self.wait_for_notification(
+        event = self.wait_for_notification(
             lambda event: event.notification_type == PORT_NOTIFICATION_TYPE
             and event.object_id == self.port.oid
             and event.state == state
         )
+        self.log_vpp_state("show", "hardware-interfaces", self.vpp_hwif)
+        return event
 
 
 class PortStateChangeTest(PortNotificationTestBase):
-    """Verify a VPP carrier-down event reaches the SAI callback bridge."""
+    """Verify a VPP link-down event reaches the SAI callback bridge."""
 
     def runTest(self):
         try:
-            self.set_peer_state(self.peer, False)
+            self.set_link_state(self.hostif_dev, False)
             self.port_event(SAI_PORT_OPER_STATUS_DOWN)
         finally:
-            self.set_peer_state(self.peer, True)
+            self.set_link_state(self.hostif_dev, True)
 
 
 class PortStateRecoveryTest(PortNotificationTestBase):
-    """Verify a carrier-down/carrier-up sequence reaches SAI in order."""
+    """Verify a link-down/link-up sequence reaches SAI in order."""
 
     def runTest(self):
         try:
-            self.set_peer_state(self.peer, False)
+            self.set_link_state(self.hostif_dev, False)
             self.port_event(SAI_PORT_OPER_STATUS_DOWN)
-            self.set_peer_state(self.peer, True)
+            self.set_link_state(self.hostif_dev, True)
             self.port_event(SAI_PORT_OPER_STATUS_UP)
         finally:
-            self.set_peer_state(self.peer, True)
+            self.set_link_state(self.hostif_dev, True)
 
 
 class BfdResponder:
-    """Small Scapy responder for one single-hop or multihop BFD session."""
+    """Small Scapy responder for one single-hop or multihop BFD session.
 
-    def __init__(self, interface_name, local_ip, remote_ip, udp_port, discriminator):
-        self.interface_name = interface_name
+    The session is anchored on a LAG router interface, and VPP picks the egress
+    member by hashing the flow, so every member peer is watched rather than
+    guessing which one carries the control packets. Replies go back out the
+    member the request arrived on.
+    """
+
+    def __init__(self, interface_names, local_ip, remote_ip, udp_port, discriminator):
+        self.interface_names = list(interface_names)
         self.local_ip = local_ip
         self.remote_ip = remote_ip
         self.udp_port = udp_port
         self.discriminator = discriminator
-        self.source_mac = get_if_hwaddr(interface_name)
+        self.source_macs = {
+            name: get_if_hwaddr(name) for name in self.interface_names
+        }
         self.stop_event = threading.Event()
-        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.threads = [
+            threading.Thread(target=self._run, args=(name,), daemon=True)
+            for name in self.interface_names
+        ]
 
     def start(self):
-        self.thread.start()
+        for thread in self.threads:
+            thread.start()
 
     def stop(self):
         self.stop_event.set()
-        self.thread.join(timeout=2)
+        for thread in self.threads:
+            thread.join(timeout=2)
 
-    def _run(self):
+    def _run(self, interface_name):
         while not self.stop_event.is_set():
             sniff(
-                iface=self.interface_name,
+                iface=interface_name,
                 filter="udp",
                 timeout=0.5,
                 store=False,
-                prn=self._respond,
+                prn=lambda packet: self._respond(interface_name, packet),
             )
 
-    def _respond(self, packet):
+    def _respond(self, interface_name, packet):
         if not packet.haslayer(Ether) or not packet.haslayer(IP):
             return
         if not packet.haslayer(UDP):
@@ -199,24 +298,37 @@ class BfdResponder:
             except Exception:
                 return
 
+        # Follow the RFC 5880 state machine. A peer sitting in Down only leaves
+        # it when it hears Down or Init, so a responder that always advertises
+        # Up leaves the session stuck with VPP Down and remote Up forever.
+        response_state = (
+            BFD_STATE_UP
+            if bfd.sta in (BFD_STATE_INIT, BFD_STATE_UP)
+            else BFD_STATE_INIT
+        )
+
         response = (
-            Ether(src=self.source_mac, dst=packet[Ether].src)
+            Ether(src=self.source_macs[interface_name], dst=packet[Ether].src)
+            # Single-hop BFD is GTSM protected, so the reply has to arrive with
+            # TTL 255. RFC 5880 also fixes the destination port at 3784 (4784 for
+            # multihop) in both directions, with an ephemeral source port; VPP
+            # silently ignores a reply that mirrors the ports instead.
             / IP(src=self.remote_ip, dst=self.local_ip, ttl=255)
-            / UDP(sport=self.udp_port, dport=udp.sport)
+            / UDP(sport=BFD_EPHEMERAL_SRC_PORT, dport=self.udp_port)
             / BFD(
                 version=1,
                 diag=0,
-                sta=3,
+                sta=response_state,
                 flags=0,
-                detect_mult=3,
+                detect_mult=BFD_MULTIPLIER,
                 my_discriminator=self.discriminator,
                 your_discriminator=bfd.my_discriminator,
-                min_tx_interval=100000,
-                min_rx_interval=100000,
+                min_tx_interval=BFD_INTERVAL_USEC,
+                min_rx_interval=BFD_INTERVAL_USEC,
                 echo_rx_interval=0,
             )
         )
-        sendp(response, iface=self.interface_name, verbose=False)
+        sendp(response, iface=interface_name, verbose=False)
 
 
 class BfdNotificationTestBase(NotificationTestBase):
@@ -259,9 +371,11 @@ class BfdNotificationTestBase(NotificationTestBase):
 
         lag = self.dut.lag_list[0]
         self.lag_rif = self.route_configer.create_router_interface(lag)
-        peer_port = lag.member_port_indexs[0]
-        self.peer = self.peer_interface(peer_port)
-        self.peer_mac = get_if_hwaddr(self.peer)
+        self.peers = [
+            self.peer_interface(port_index)
+            for port_index in lag.member_port_indexs
+        ]
+        self.peer_mac = get_if_hwaddr(self.peers[0])
 
         self.neighbor_entry = sai_thrift_neighbor_entry_t(
             rif_id=self.lag_rif,
@@ -296,7 +410,7 @@ class BfdNotificationTestBase(NotificationTestBase):
 
     def start_session(self):
         self.responder = BfdResponder(
-            self.peer,
+            self.peers,
             self.local_ip,
             self.remote_ip,
             self.udp_port,
@@ -315,9 +429,9 @@ class BfdNotificationTestBase(NotificationTestBase):
             iphdr_version=4,
             src_ip_address=sai_ipaddress(self.local_ip),
             dst_ip_address=sai_ipaddress(self.remote_ip),
-            min_tx=100000,
-            min_rx=100000,
-            multiplier=3,
+            min_tx=BFD_INTERVAL_USEC,
+            min_rx=BFD_INTERVAL_USEC,
+            multiplier=BFD_MULTIPLIER,
             hw_lookup_valid=True,
             multihop=self.multihop,
             cbit=False,
@@ -330,7 +444,8 @@ class BfdNotificationTestBase(NotificationTestBase):
         return self.wait_for_notification(
             lambda event: event.notification_type == BFD_NOTIFICATION_TYPE
             and event.object_id == self.bfd_session
-            and event.state == state
+            and event.state == state,
+            timeout=BFD_NOTIFICATION_TIMEOUT,
         )
 
     def assert_bfd_state(self, state):
@@ -340,6 +455,24 @@ class BfdNotificationTestBase(NotificationTestBase):
             state=True,
         )
         self.assertEqual(attributes["state"], state)
+
+    def assert_vpp_bfd_state(self, expected_state_word):
+        """Corroborate the SAI state against VPP's own session table.
+
+        SAI_BFD_SESSION_ATTR_STATE is written by the same code path that emits
+        the notification, so it cannot on its own show that VPP really moved.
+        """
+        output = self.log_vpp_state("show", "bfd", "sessions")
+        self.assertIn(
+            self.remote_ip,
+            output,
+            "VPP has no BFD session towards {}".format(self.remote_ip),
+        )
+        self.assertRegex(
+            output,
+            r"(?i)\b{}\b".format(expected_state_word),
+            "VPP did not report BFD state {}".format(expected_state_word),
+        )
 
     def tearDown(self):
         try:
@@ -357,26 +490,34 @@ class BfdNotificationTestBase(NotificationTestBase):
             super().tearDown()
 
 
+    def bring_session_up(self):
+        self.start_session()
+        self.bfd_event(SAI_BFD_SESSION_STATE_UP)
+        self.assert_bfd_state(SAI_BFD_SESSION_STATE_UP)
+        self.assert_vpp_bfd_state("up")
+
+    def break_path(self):
+        """Silence the peer so VPP misses detect_mult consecutive intervals."""
+        self.responder.stop()
+        self.responder = None
+        self.bfd_event(SAI_BFD_SESSION_STATE_DOWN)
+        self.assert_bfd_state(SAI_BFD_SESSION_STATE_DOWN)
+        self.assert_vpp_bfd_state("down")
+
+
 class BfdSessionUpTest(BfdNotificationTestBase):
     """Verify that a responder-driven BFD session emits an UP notification."""
 
     def runTest(self):
-        self.start_session()
-        self.bfd_event(SAI_BFD_SESSION_STATE_UP)
-        self.assert_bfd_state(SAI_BFD_SESSION_STATE_UP)
+        self.bring_session_up()
 
 
 class BfdSessionDownTest(BfdNotificationTestBase):
     """Verify that stopping the responder emits a BFD DOWN notification."""
 
     def runTest(self):
-        self.start_session()
-        self.bfd_event(SAI_BFD_SESSION_STATE_UP)
-        self.assert_bfd_state(SAI_BFD_SESSION_STATE_UP)
-        self.responder.stop()
-        self.responder = None
-        self.bfd_event(SAI_BFD_SESSION_STATE_DOWN)
-        self.assert_bfd_state(SAI_BFD_SESSION_STATE_DOWN)
+        self.bring_session_up()
+        self.break_path()
 
 
 class BfdMultihopTest(BfdNotificationTestBase):
@@ -388,6 +529,5 @@ class BfdMultihopTest(BfdNotificationTestBase):
     multihop = True
 
     def runTest(self):
-        self.start_session()
-        self.bfd_event(SAI_BFD_SESSION_STATE_UP)
-        self.assert_bfd_state(SAI_BFD_SESSION_STATE_UP)
+        self.bring_session_up()
+        self.break_path()
