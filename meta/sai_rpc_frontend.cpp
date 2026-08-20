@@ -897,15 +897,17 @@ static void sai_thrift_nat_type_t_parse(
 
 namespace
 {
-    constexpr std::int32_t kPortStateChangeNotification = 0;
-    constexpr std::int32_t kBfdSessionStateChangeNotification = 1;
+    constexpr sai_thrift_notification_type_t::type kPortStateChangeNotification =
+            sai_thrift_notification_type_t::SAI_THRIFT_NOTIFICATION_TYPE_PORT_STATE_CHANGE;
+    constexpr sai_thrift_notification_type_t::type kBfdSessionStateChangeNotification =
+            sai_thrift_notification_type_t::SAI_THRIFT_NOTIFICATION_TYPE_BFD_SESSION_STATE_CHANGE;
     constexpr std::size_t kNotificationQueueCapacity = 256;
 
     std::mutex notification_queue_mutex;
     std::deque<sai_thrift_notification_event_t> notification_queue;
 
     void enqueue_notification(
-            std::int32_t notification_type,
+            sai_thrift_notification_type_t::type notification_type,
             sai_object_id_t object_id,
             std::int32_t state)
     {
