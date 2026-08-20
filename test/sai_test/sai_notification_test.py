@@ -9,20 +9,14 @@
 #    LIMITATION ANY IMPLIED WARRANTIES OR CONDITIONS OF TITLE, FITNESS
 #    FOR A PARTICULAR PURPOSE, MERCHANTABILITY OR NON-INFRINGEMENT.
 
-"""Opt-in VPP SAI notification tests."""
+"""Opt-in SAI notification tests with a VPP-specific BFD fixture."""
 
 import re
 import os
-import subprocess
 import threading
 import time
 
-from ptf import config as ptf_config
 from ptf.testutils import test_params_get
-from unittest import SkipTest
-
-from scapy.all import Ether, IP, UDP, get_if_hwaddr, sendp, sniff
-from scapy.contrib.bfd import BFD
 
 from sai_thrift.sai_adapter import *
 from sai_test_base import T0TestBase
@@ -31,8 +25,10 @@ from sai_utils import sai_ipaddress, sai_ipprefix
 
 PORT_NOTIFICATION_TYPE = 0
 BFD_NOTIFICATION_TYPE = 1
-NOTIFICATION_TEST_PARAM = "vpp_notification_test"
+NOTIFICATION_TEST_PARAM = "notification_test"
 NOTIFICATION_TEST_VALUE = "true"
+PLATFORM_PARAM = "platform"
+VPP_PLATFORM = "vpp"
 NOTIFICATION_TIMEOUT = 5.0
 NOTIFICATION_POLL_INTERVAL = 0.5
 # RFC 5880 holds the control-packet interval at one second until a session is
@@ -40,9 +36,6 @@ NOTIFICATION_POLL_INTERVAL = 0.5
 # Measured bring-up against the scapy responder is around 5.5s, on top of which
 # the notification still has to clear the VPP event poll.
 BFD_NOTIFICATION_TIMEOUT = 25.0
-# vppProcessEvents() sleeps this long between drains of the VPP event queue, so
-# link changes made just before a test starts can still be in flight.
-VPP_EVENT_POLL_SECONDS = 2.0
 VPPCTL_TIMEOUT = 10
 BFD_EPHEMERAL_SRC_PORT = 49152
 BFD_STATE_INIT = 2
@@ -111,75 +104,8 @@ class NotificationTestBase(T0TestBase):
             )
         )
 
-    @staticmethod
-    def peer_interface(port_index):
-        for _, configured_port, interface_name in ptf_config.get("interfaces", []):
-            if configured_port == port_index:
-                if not re.fullmatch(r"OEth[0-9]+_peer", interface_name):
-                    raise AssertionError(
-                        "unexpected VPP PTF peer interface: {}".format(interface_name)
-                    )
-                return interface_name
-        raise AssertionError(
-            "PTF interface for port {} was not configured".format(port_index)
-        )
-
-    @staticmethod
-    def vpp_interface(peer_name):
-        match = re.fullmatch(r"OEth([0-9]+)_peer", peer_name)
-        if match is None:
-            raise AssertionError(
-                "unexpected VPP PTF peer interface: {}".format(peer_name)
-            )
-        return "OEthernet{}".format(match.group(1))
-
-    @staticmethod
-    def vpp_hwif_name(vpp_interface_name):
-        return "host-{}".format(vpp_interface_name)
-
-    @staticmethod
-    def set_link_state(interface_name, is_up):
-        state = "up" if is_up else "down"
-        subprocess.run(
-            ["ip", "link", "set", "dev", interface_name, state],
-            check=True,
-        )
-
-    @staticmethod
-    def vppctl(*command):
-        """Return combined vppctl output, used as dataplane-side evidence.
-
-        Reading VPP directly keeps the assertions independent of the SAI object
-        that the notification itself updates.
-        """
-        result = subprocess.run(
-            ["vppctl"] + list(command),
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=VPPCTL_TIMEOUT,
-        )
-        return result.stdout.decode("utf-8", "replace")
-
-    def log_vpp_state(self, *command):
-        output = self.vppctl(*command)
-        print("vppctl {}:\n{}".format(" ".join(command), output))
-        return output
-
-
 class PortNotificationTestBase(NotificationTestBase):
-    """Port notification setup without unrelated L3 configuration.
-
-    The link is flapped on the SAI host-interface netdev rather than on the
-    wire-side ``OEth<N>_peer``. VPP binds ``host-OEthernet<N>`` with an
-    AF_PACKET socket, and that driver does not watch the underlying netdev's
-    carrier: downing the veth peer leaves Linux reporting NO-CARRIER while
-    ``vppctl show hardware-interfaces`` still reports the link up, so no
-    ``sw_interface_event`` is ever raised and no notification can follow.
-    Downing the host-interface netdev is still the HLD's ``ip link set down``
-    stimulus, and linux-cp propagates it to the paired hardware interface,
-    which does raise the asynchronous VPP event under test.
-    """
+    """Port notification setup without unrelated L3 configuration."""
 
     def setUp(self):
         super().setUp(
@@ -194,48 +120,56 @@ class PortNotificationTestBase(NotificationTestBase):
             wait_sec=1,
         )
         self.port = self.dut.port_obj_list[0]
-        self.hostif_dev = self.port.config.name
-        self.vpp_hwif = self.vpp_hwif_name(
-            self.vpp_interface(self.peer_interface(self.port.dev_port_index))
+        attributes = sai_thrift_get_port_attribute(
+            self.client,
+            port_oid=self.port.oid,
+            admin_state=True,
         )
-        self.set_link_state(self.hostif_dev, True)
-        # Let the link-up events raised above reach the queue before the
-        # discard, otherwise they surface mid-test and the port looks flappy.
-        time.sleep(VPP_EVENT_POLL_SECONDS * 2)
+        self.initial_admin_state = attributes["admin_state"]
+        self.assertTrue(
+            self.initial_admin_state,
+            "test fixture must provide an administratively up port",
+        )
         self.discard_pending_notifications()
 
     def port_event(self, state):
-        event = self.wait_for_notification(
+        return self.wait_for_notification(
             lambda event: event.notification_type == PORT_NOTIFICATION_TYPE
             and event.object_id == self.port.oid
             and event.state == state
         )
-        self.log_vpp_state("show", "hardware-interfaces", self.vpp_hwif)
-        return event
+
+    def set_admin_state(self, admin_state):
+        status = sai_thrift_set_port_attribute(
+            self.client,
+            port_oid=self.port.oid,
+            admin_state=admin_state,
+        )
+        self.assertEqual(status, SAI_STATUS_SUCCESS)
 
 
 class PortStateChangeTest(PortNotificationTestBase):
-    """Verify a VPP link-down event reaches the SAI callback bridge."""
+    """Verify a port admin-down event reaches the SAI callback bridge."""
 
     def runTest(self):
         try:
-            self.set_link_state(self.hostif_dev, False)
+            self.set_admin_state(False)
             self.port_event(SAI_PORT_OPER_STATUS_DOWN)
         finally:
-            self.set_link_state(self.hostif_dev, True)
+            self.set_admin_state(self.initial_admin_state)
 
 
 class PortStateRecoveryTest(PortNotificationTestBase):
-    """Verify a link-down/link-up sequence reaches SAI in order."""
+    """Verify a port admin-down/admin-up sequence reaches SAI in order."""
 
     def runTest(self):
         try:
-            self.set_link_state(self.hostif_dev, False)
+            self.set_admin_state(False)
             self.port_event(SAI_PORT_OPER_STATUS_DOWN)
-            self.set_link_state(self.hostif_dev, True)
+            self.set_admin_state(True)
             self.port_event(SAI_PORT_OPER_STATUS_UP)
         finally:
-            self.set_link_state(self.hostif_dev, True)
+            self.set_admin_state(self.initial_admin_state)
 
 
 class BfdResponder:
@@ -253,6 +187,8 @@ class BfdResponder:
         self.remote_ip = remote_ip
         self.udp_port = udp_port
         self.discriminator = discriminator
+        from scapy.all import get_if_hwaddr
+
         self.source_macs = {
             name: get_if_hwaddr(name) for name in self.interface_names
         }
@@ -272,6 +208,8 @@ class BfdResponder:
             thread.join(timeout=2)
 
     def _run(self, interface_name):
+        from scapy.all import sniff
+
         while not self.stop_event.is_set():
             sniff(
                 iface=interface_name,
@@ -282,6 +220,9 @@ class BfdResponder:
             )
 
     def _respond(self, interface_name, packet):
+        from scapy.all import Ether, IP, UDP, sendp
+        from scapy.contrib.bfd import BFD
+
         if not packet.haslayer(Ether) or not packet.haslayer(IP):
             return
         if not packet.haslayer(UDP):
@@ -342,7 +283,48 @@ class BfdNotificationTestBase(NotificationTestBase):
     udp_port = 3784
     multihop = False
 
+    @staticmethod
+    def peer_interface(port_index):
+        from ptf import config as ptf_config
+
+        for _, configured_port, interface_name in ptf_config.get("interfaces", []):
+            if configured_port == port_index:
+                if not re.fullmatch(r"OEth[0-9]+_peer", interface_name):
+                    raise AssertionError(
+                        "unexpected VPP PTF peer interface: {}".format(interface_name)
+                    )
+                return interface_name
+        raise AssertionError(
+            "PTF interface for port {} was not configured".format(port_index)
+        )
+
+    @staticmethod
+    def vppctl(*command):
+        """Return VPP state as independent evidence for the BFD assertion."""
+        import subprocess
+
+        result = subprocess.run(
+            ["vppctl"] + list(command),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=VPPCTL_TIMEOUT,
+        )
+        return result.stdout.decode("utf-8", "replace")
+
+    def log_vpp_state(self, *command):
+        output = self.vppctl(*command)
+        print("vppctl {}:\n{}".format(" ".join(command), output))
+        return output
+
     def setUp(self):
+        params = test_params_get() or {}
+        if params.get(PLATFORM_PARAM) != VPP_PLATFORM:
+            super().setUp(
+                skip_reason="BFD notification tests require platform='vpp'"
+            )
+            return
+
         if os.environ.get("SIMULATE_SONIC") != "1":
             super().setUp(skip_reason="BFD notification tests require SIMULATE_SONIC=1")
             return
@@ -375,6 +357,8 @@ class BfdNotificationTestBase(NotificationTestBase):
             self.peer_interface(port_index)
             for port_index in lag.member_port_indexs
         ]
+        from scapy.all import get_if_hwaddr
+
         self.peer_mac = get_if_hwaddr(self.peers[0])
 
         self.neighbor_entry = sai_thrift_neighbor_entry_t(
