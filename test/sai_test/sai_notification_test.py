@@ -17,6 +17,7 @@ import threading
 import time
 
 from ptf.testutils import test_params_get
+from unittest import SkipTest
 
 from sai_thrift.sai_adapter import *
 from sai_test_base import T0TestBase
@@ -124,13 +125,20 @@ class PortNotificationTestBase(NotificationTestBase):
             self.client,
             port_oid=self.port.oid,
             admin_state=True,
+            oper_status=True,
         )
         self.initial_admin_state = attributes["admin_state"]
-        self.assertTrue(
-            self.initial_admin_state,
-            "test fixture must provide an administratively up port",
-        )
+        self.initial_oper_status = attributes["oper_status"]
+        self.port_skip_reason = None
+        if not self.initial_admin_state:
+            self.port_skip_reason = "test fixture must provide an administratively up port"
+        elif self.initial_oper_status != SAI_PORT_OPER_STATUS_UP:
+            self.port_skip_reason = "test fixture must provide an operationally up port"
         self.discard_pending_notifications()
+
+    def require_port_ready(self):
+        if self.port_skip_reason:
+            raise SkipTest(self.port_skip_reason)
 
     def port_event(self, state):
         return self.wait_for_notification(
@@ -152,6 +160,7 @@ class PortStateChangeTest(PortNotificationTestBase):
     """Verify a port admin-down event reaches the SAI callback bridge."""
 
     def runTest(self):
+        self.require_port_ready()
         try:
             self.set_admin_state(False)
             self.port_event(SAI_PORT_OPER_STATUS_DOWN)
@@ -163,6 +172,7 @@ class PortStateRecoveryTest(PortNotificationTestBase):
     """Verify a port admin-down/admin-up sequence reaches SAI in order."""
 
     def runTest(self):
+        self.require_port_ready()
         try:
             self.set_admin_state(False)
             self.port_event(SAI_PORT_OPER_STATUS_DOWN)
@@ -331,6 +341,7 @@ class BfdNotificationTestBase(NotificationTestBase):
 
         self.bfd_session = None
         self.lag_rif = None
+        self.owns_lag_rif = False
         self.neighbor_entry = None
         self.next_hop = None
         self.route_entry = None
@@ -352,7 +363,9 @@ class BfdNotificationTestBase(NotificationTestBase):
             self.route_configer.get_default_virtual_router()
 
         lag = self.dut.lag_list[0]
+        existing_rifs = set(lag.rif_list or [])
         self.lag_rif = self.route_configer.create_router_interface(lag)
+        self.owns_lag_rif = self.lag_rif not in existing_rifs
         self.peers = [
             self.peer_interface(port_index)
             for port_index in lag.member_port_indexs
@@ -470,6 +483,8 @@ class BfdNotificationTestBase(NotificationTestBase):
                 sai_thrift_remove_next_hop(self.client, self.next_hop)
             if self.neighbor_entry is not None:
                 sai_thrift_remove_neighbor_entry(self.client, self.neighbor_entry)
+            if self.owns_lag_rif:
+                sai_thrift_remove_router_interface(self.client, self.lag_rif)
         finally:
             super().tearDown()
 
