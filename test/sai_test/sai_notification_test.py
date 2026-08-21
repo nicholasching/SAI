@@ -56,7 +56,7 @@ class NotificationTestBase(T0TestBase):
         self.pending_events = []
         params = test_params_get() or {}
         if params.get(NOTIFICATION_TEST_PARAM) != NOTIFICATION_TEST_VALUE:
-            super().setUp(skip_reason="VPP notification tests are opt-in")
+            super().setUp(skip_reason="SAI notification tests are opt-in")
             return
 
         T0TestBase.setUp(self, **kwargs)
