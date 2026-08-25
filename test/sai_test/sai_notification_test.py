@@ -346,7 +346,8 @@ class BfdNotificationTestBase(NotificationTestBase):
 
     def setUp(self):
         params = test_params_get() or {}
-        if params.get(PLATFORM_PARAM) != VPP_PLATFORM:
+        self.platform = params.get(PLATFORM_PARAM)
+        if self.platform != VPP_PLATFORM:
             super().setUp(
                 skip_reason="BFD notification tests require platform='vpp'"
             )
@@ -510,7 +511,8 @@ class BfdNotificationTestBase(NotificationTestBase):
         self.start_session()
         self.bfd_event(SAI_BFD_SESSION_STATE_UP)
         self.assert_bfd_state(SAI_BFD_SESSION_STATE_UP)
-        self.assert_vpp_bfd_state("up")
+        if self.platform == VPP_PLATFORM:
+            self.assert_vpp_bfd_state("up")
 
     def break_path(self):
         """Silence the peer so VPP misses detect_mult consecutive intervals."""
@@ -518,7 +520,8 @@ class BfdNotificationTestBase(NotificationTestBase):
         self.responder = None
         self.bfd_event(SAI_BFD_SESSION_STATE_DOWN)
         self.assert_bfd_state(SAI_BFD_SESSION_STATE_DOWN)
-        self.assert_vpp_bfd_state("down")
+        if self.platform == VPP_PLATFORM:
+            self.assert_vpp_bfd_state("down")
 
 
 class BfdSessionUpTest(BfdNotificationTestBase):
