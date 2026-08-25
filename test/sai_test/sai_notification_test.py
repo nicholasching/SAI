@@ -9,11 +9,9 @@
 #    LIMITATION ANY IMPLIED WARRANTIES OR CONDITIONS OF TITLE, FITNESS
 #    FOR A PARTICULAR PURPOSE, MERCHANTABILITY OR NON-INFRINGEMENT.
 
-"""Opt-in SAI notification tests with a VPP-specific BFD fixture."""
+"""Opt-in SAI notification tests with a provider-backed BFD fixture."""
 
-import re
-import os
-import threading
+import importlib
 import time
 
 from ptf.testutils import test_params_get
@@ -21,7 +19,6 @@ from unittest import SkipTest
 
 from sai_thrift.sai_adapter import *
 from sai_test_base import T0TestBase
-from sai_utils import sai_ipaddress, sai_ipprefix
 
 
 PORT_NOTIFICATION_TYPE = (
@@ -32,26 +29,9 @@ BFD_NOTIFICATION_TYPE = (
 )
 NOTIFICATION_TEST_PARAM = "notification_test"
 NOTIFICATION_TEST_VALUE = "true"
-PLATFORM_PARAM = "platform"
-VPP_PLATFORM = "vpp"
+BFD_FIXTURE_PARAM = "bfd_fixture"
 NOTIFICATION_TIMEOUT = 5.0
 NOTIFICATION_POLL_INTERVAL = 0.5
-# RFC 5880 holds the control-packet interval at one second until a session is
-# up, so a fresh BFD session needs several round trips before it transitions.
-# Measured bring-up against the scapy responder is around 5.5s, on top of which
-# the notification still has to clear the VPP event poll.
-BFD_NOTIFICATION_TIMEOUT = 25.0
-VPPCTL_TIMEOUT = 10
-SNIFFER_START_TIMEOUT = 5.0
-BFD_EPHEMERAL_SRC_PORT = 49152
-BFD_STATE_INIT = 2
-BFD_STATE_UP = 3
-# A scapy responder cannot sustain a sub-second reply cadence reliably, and at
-# the SAI default the negotiated interval drops the session within 300ms of a
-# missed reply. One second with a multiplier of three keeps the session stable
-# while still detecting a broken path in about three seconds.
-BFD_INTERVAL_USEC = 1000000
-BFD_MULTIPLIER = 3
 
 
 class NotificationTestBase(T0TestBase):
@@ -109,6 +89,7 @@ class NotificationTestBase(T0TestBase):
                 ]
             )
         )
+
 
 class PortNotificationTestBase(NotificationTestBase):
     """Port notification setup without unrelated L3 configuration."""
@@ -187,280 +168,55 @@ class PortStateRecoveryTest(PortNotificationTestBase):
             self.set_admin_state(self.initial_admin_state)
 
 
-class BfdResponder:
-    """Small Scapy responder for one single-hop or multihop BFD session.
+class BfdNotificationTestBase(NotificationTestBase):
+    """Run generic BFD notification checks against a platform-supplied fixture.
 
-    The session is anchored on a LAG router interface, and VPP picks the egress
-    member by hashing the flow, so every member peer is watched rather than
-    guessing which one carries the control packets. Replies go back out the
-    member the request arrived on.
+    The fixture module is named by the ``bfd_fixture`` test parameter and must
+    expose ``create_fixture(test_obj, multihop)`` returning an object with
+    ``common_config_kwargs()``, ``setup()``, ``start_session()`` returning the
+    BFD session OID, ``stop_peer()`` and ``teardown()``. It may also provide
+    ``notification_timeout`` and ``assert_external_state(state_word)`` to
+    corroborate the transition against the platform's own state.
     """
 
-    def __init__(self, interface_names, local_ip, remote_ip, udp_port, discriminator):
-        self.interface_names = list(interface_names)
-        self.local_ip = local_ip
-        self.remote_ip = remote_ip
-        self.udp_port = udp_port
-        self.discriminator = discriminator
-        from scapy.all import get_if_hwaddr
-
-        self.source_macs = {
-            name: get_if_hwaddr(name) for name in self.interface_names
-        }
-        self.sniffers = []
-
-    def start(self):
-        import functools
-
-        from scapy.all import AsyncSniffer
-
-        for interface_name in self.interface_names:
-            ready = threading.Event()
-            sniffer = AsyncSniffer(
-                iface=interface_name,
-                filter="udp dst port {} and src host {}".format(
-                    self.udp_port, self.local_ip
-                ),
-                store=False,
-                prn=functools.partial(self._respond, interface_name),
-                started_callback=ready.set,
-            )
-            sniffer.start()
-            self.sniffers.append(sniffer)
-
-            if not ready.wait(timeout=SNIFFER_START_TIMEOUT):
-                self.stop()
-                raise AssertionError(
-                    "BFD responder failed to start capture on {}".format(
-                        interface_name
-                    )
-                )
-
-    def stop(self):
-        for sniffer in self.sniffers:
-            try:
-                sniffer.stop()
-            except Exception:
-                # stop() raises if the sniffer never reached its run loop, which
-                # happens when start() aborts partway and unwinds through here.
-                pass
-        self.sniffers = []
-
-    def _respond(self, interface_name, packet):
-        from scapy.all import Ether, IP, UDP, sendp
-        from scapy.contrib.bfd import BFD
-
-        if not packet.haslayer(Ether) or not packet.haslayer(IP):
-            return
-        if not packet.haslayer(UDP):
-            return
-
-        udp = packet[UDP]
-        if udp.dport != self.udp_port:
-            return
-
-        bfd = packet.getlayer(BFD)
-        if bfd is None:
-            try:
-                bfd = BFD(bytes(udp.payload))
-            except Exception:
-                return
-
-        # Follow the RFC 5880 state machine. A peer sitting in Down only leaves
-        # it when it hears Down or Init, so a responder that always advertises
-        # Up leaves the session stuck with VPP Down and remote Up forever.
-        response_state = (
-            BFD_STATE_UP
-            if bfd.sta in (BFD_STATE_INIT, BFD_STATE_UP)
-            else BFD_STATE_INIT
-        )
-
-        response = (
-            Ether(src=self.source_macs[interface_name], dst=packet[Ether].src)
-            # Single-hop BFD is GTSM protected, so the reply has to arrive with
-            # TTL 255. RFC 5880 also fixes the destination port at 3784 (4784 for
-            # multihop) in both directions, with an ephemeral source port; VPP
-            # silently ignores a reply that mirrors the ports instead.
-            / IP(src=self.remote_ip, dst=self.local_ip, ttl=255)
-            / UDP(sport=BFD_EPHEMERAL_SRC_PORT, dport=self.udp_port)
-            / BFD(
-                version=1,
-                diag=0,
-                sta=response_state,
-                flags=0,
-                detect_mult=BFD_MULTIPLIER,
-                my_discriminator=self.discriminator,
-                your_discriminator=bfd.my_discriminator,
-                min_tx_interval=BFD_INTERVAL_USEC,
-                min_rx_interval=BFD_INTERVAL_USEC,
-                echo_rx_interval=0,
-            )
-        )
-        sendp(response, iface=interface_name, verbose=False)
-
-
-class BfdNotificationTestBase(NotificationTestBase):
-    """Build a LAG-backed BFD session with a real connected local address."""
-
-    local_ip = "10.1.1.1"
-    remote_ip = "10.1.1.2"
-    gateway_ip = "10.1.1.2"
-    local_discriminator = 0x1001
-    remote_discriminator = 0x2001
-    udp_port = 3784
     multihop = False
-
-    @staticmethod
-    def peer_interface(port_index):
-        from ptf import config as ptf_config
-
-        for _, configured_port, interface_name in ptf_config.get("interfaces", []):
-            if configured_port == port_index:
-                if not re.fullmatch(r"OEth[0-9]+_peer", interface_name):
-                    raise AssertionError(
-                        "unexpected VPP PTF peer interface: {}".format(interface_name)
-                    )
-                return interface_name
-        raise AssertionError(
-            "PTF interface for port {} was not configured".format(port_index)
-        )
-
-    @staticmethod
-    def vppctl(*command):
-        """Return VPP state as independent evidence for the BFD assertion."""
-        import subprocess
-
-        result = subprocess.run(
-            ["vppctl"] + list(command),
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=VPPCTL_TIMEOUT,
-        )
-        return result.stdout.decode("utf-8", "replace")
-
-    def log_vpp_state(self, *command):
-        output = self.vppctl(*command)
-        print("vppctl {}:\n{}".format(" ".join(command), output))
-        return output
 
     def setUp(self):
         params = test_params_get() or {}
-        self.platform = params.get(PLATFORM_PARAM)
-        if self.platform != VPP_PLATFORM:
-            super().setUp(
-                skip_reason="BFD notification tests require platform='vpp'"
-            )
+        fixture_name = params.get(BFD_FIXTURE_PARAM)
+        self.bfd_fixture = None
+        if not fixture_name:
+            super().setUp(skip_reason="BFD notification fixture is not configured")
             return
 
-        if os.environ.get("SIMULATE_SONIC") != "1":
-            super().setUp(skip_reason="BFD notification tests require SIMULATE_SONIC=1")
-            return
+        fixture_module = importlib.import_module(fixture_name)
+        self.bfd_fixture = fixture_module.create_fixture(self, self.multihop)
 
-        self.bfd_session = None
-        self.lag_rif = None
-        self.owns_lag_rif = False
-        self.neighbor_entry = None
-        self.next_hop = None
-        self.route_entry = None
-        self.responder = None
+        try:
+            super().setUp(**self.bfd_fixture.common_config_kwargs())
+            self.bfd_fixture.setup()
+        except Exception:
+            self.bfd_fixture.teardown()
+            raise
 
-        super().setUp(
-            is_remove_default_vlan=False,
-            is_create_vlan=False,
-            is_create_fdb=False,
-            is_create_default_route=False,
-            is_create_lag=True,
-            is_create_vlan_itf=False,
-            is_create_route_for_vlan_itf=False,
-            is_create_route_for_lag=False,
-            wait_sec=1,
-        )
-
-        if not self.dut.default_vrf:
-            self.route_configer.get_default_virtual_router()
-
-        lag = self.dut.lag_list[0]
-        existing_rifs = set(lag.rif_list or [])
-        self.lag_rif = self.route_configer.create_router_interface(lag)
-        self.owns_lag_rif = self.lag_rif not in existing_rifs
-        self.peers = [
-            self.peer_interface(port_index)
-            for port_index in lag.member_port_indexs
-        ]
-        from scapy.all import get_if_hwaddr
-
-        self.peer_mac = get_if_hwaddr(self.peers[0])
-
-        self.neighbor_entry = sai_thrift_neighbor_entry_t(
-            rif_id=self.lag_rif,
-            ip_address=sai_ipaddress(self.gateway_ip),
-        )
-        status = sai_thrift_create_neighbor_entry(
-            self.client,
-            self.neighbor_entry,
-            dst_mac_address=self.peer_mac,
-            no_host_route=False,
-        )
-        self.assertEqual(status, SAI_STATUS_SUCCESS)
-
-        if self.multihop:
-            self.next_hop = sai_thrift_create_next_hop(
-                self.client,
-                ip=sai_ipaddress(self.gateway_ip),
-                router_interface_id=self.lag_rif,
-                type=SAI_NEXT_HOP_TYPE_IP,
-            )
-            self.assertEqual(self.status(), SAI_STATUS_SUCCESS)
-            self.route_entry = sai_thrift_route_entry_t(
-                vr_id=self.dut.default_vrf,
-                destination=sai_ipprefix(self.remote_ip + "/32"),
-            )
-            status = sai_thrift_create_route_entry(
-                self.client,
-                self.route_entry,
-                next_hop_id=self.next_hop,
-            )
-            self.assertEqual(status, SAI_STATUS_SUCCESS)
-
-    def start_session(self):
-        self.responder = BfdResponder(
-            self.peers,
-            self.local_ip,
-            self.remote_ip,
-            self.udp_port,
-            self.remote_discriminator,
-        )
-        self.responder.start()
-
-        self.bfd_session = sai_thrift_create_bfd_session(
-            self.client,
-            type=SAI_BFD_SESSION_TYPE_ASYNC_ACTIVE,
-            virtual_router=self.dut.default_vrf,
-            local_discriminator=self.local_discriminator,
-            remote_discriminator=self.remote_discriminator,
-            udp_src_port=49152,
-            bfd_encapsulation_type=SAI_BFD_ENCAPSULATION_TYPE_NONE,
-            iphdr_version=4,
-            src_ip_address=sai_ipaddress(self.local_ip),
-            dst_ip_address=sai_ipaddress(self.remote_ip),
-            min_tx=BFD_INTERVAL_USEC,
-            min_rx=BFD_INTERVAL_USEC,
-            multiplier=BFD_MULTIPLIER,
-            hw_lookup_valid=True,
-            multihop=self.multihop,
-            cbit=False,
-            admin_state=True,
-        )
-        self.assertNotEqual(self.bfd_session, SAI_NULL_OBJECT_ID)
-        self.assertEqual(self.status(), SAI_STATUS_SUCCESS)
+    def tearDown(self):
+        try:
+            if self.bfd_fixture is not None:
+                self.bfd_fixture.teardown()
+        finally:
+            super().tearDown()
 
     def bfd_event(self, state):
+        timeout = getattr(
+            self.bfd_fixture,
+            "notification_timeout",
+            NOTIFICATION_TIMEOUT,
+        )
         return self.wait_for_notification(
             lambda event: event.notification_type == BFD_NOTIFICATION_TYPE
             and event.object_id == self.bfd_session
             and event.state == state,
-            timeout=BFD_NOTIFICATION_TIMEOUT,
+            timeout=timeout,
         )
 
     def assert_bfd_state(self, state):
@@ -471,68 +227,40 @@ class BfdNotificationTestBase(NotificationTestBase):
         )
         self.assertEqual(attributes["state"], state)
 
-    def assert_vpp_bfd_state(self, expected_state_word):
-        """Corroborate the SAI state against VPP's own session table.
-
-        SAI_BFD_SESSION_ATTR_STATE is written by the same code path that emits
-        the notification, so it cannot on its own show that VPP really moved.
-        """
-        output = self.log_vpp_state("show", "bfd", "sessions")
-        self.assertIn(
-            self.remote_ip,
-            output,
-            "VPP has no BFD session towards {}".format(self.remote_ip),
-        )
-        self.assertRegex(
-            output,
-            r"(?i)\b{}\b".format(expected_state_word),
-            "VPP did not report BFD state {}".format(expected_state_word),
-        )
-
-    def tearDown(self):
-        try:
-            if self.responder is not None:
-                self.responder.stop()
-            if self.bfd_session is not None:
-                sai_thrift_remove_bfd_session(self.client, self.bfd_session)
-            if self.route_entry is not None:
-                sai_thrift_remove_route_entry(self.client, self.route_entry)
-            if self.next_hop is not None:
-                sai_thrift_remove_next_hop(self.client, self.next_hop)
-            if self.neighbor_entry is not None:
-                sai_thrift_remove_neighbor_entry(self.client, self.neighbor_entry)
-            if self.owns_lag_rif:
-                sai_thrift_remove_router_interface(self.client, self.lag_rif)
-        finally:
-            super().tearDown()
-
-
     def bring_session_up(self):
-        self.start_session()
+        self.bfd_session = self.bfd_fixture.start_session()
         self.bfd_event(SAI_BFD_SESSION_STATE_UP)
         self.assert_bfd_state(SAI_BFD_SESSION_STATE_UP)
-        if self.platform == VPP_PLATFORM:
-            self.assert_vpp_bfd_state("up")
+        assert_external_state = getattr(
+            self.bfd_fixture,
+            "assert_external_state",
+            None,
+        )
+        if assert_external_state is not None:
+            assert_external_state("up")
 
     def break_path(self):
-        """Silence the peer so VPP misses detect_mult consecutive intervals."""
-        self.responder.stop()
-        self.responder = None
+        self.bfd_fixture.stop_peer()
         self.bfd_event(SAI_BFD_SESSION_STATE_DOWN)
         self.assert_bfd_state(SAI_BFD_SESSION_STATE_DOWN)
-        if self.platform == VPP_PLATFORM:
-            self.assert_vpp_bfd_state("down")
+        assert_external_state = getattr(
+            self.bfd_fixture,
+            "assert_external_state",
+            None,
+        )
+        if assert_external_state is not None:
+            assert_external_state("down")
 
 
 class BfdSessionUpTest(BfdNotificationTestBase):
-    """Verify that a responder-driven BFD session emits an UP notification."""
+    """Verify that a fixture-driven BFD session emits an UP notification."""
 
     def runTest(self):
         self.bring_session_up()
 
 
 class BfdSessionDownTest(BfdNotificationTestBase):
-    """Verify that stopping the responder emits a BFD DOWN notification."""
+    """Verify that stopping the peer emits a BFD DOWN notification."""
 
     def runTest(self):
         self.bring_session_up()
@@ -540,11 +268,8 @@ class BfdSessionDownTest(BfdNotificationTestBase):
 
 
 class BfdMultihopTest(BfdNotificationTestBase):
-    """Verify multihop BFD uses UDP/4784 and a routed lookup."""
+    """Verify a fixture-provided multihop BFD session transition."""
 
-    remote_ip = "10.1.2.2"
-    gateway_ip = "10.1.1.2"
-    udp_port = 4784
     multihop = True
 
     def runTest(self):
