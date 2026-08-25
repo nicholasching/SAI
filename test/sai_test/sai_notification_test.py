@@ -42,6 +42,7 @@ NOTIFICATION_POLL_INTERVAL = 0.5
 # the notification still has to clear the VPP event poll.
 BFD_NOTIFICATION_TIMEOUT = 25.0
 VPPCTL_TIMEOUT = 10
+SNIFFER_START_TIMEOUT = 5.0
 BFD_EPHEMERAL_SRC_PORT = 49152
 BFD_STATE_INIT = 2
 BFD_STATE_UP = 3
@@ -206,32 +207,44 @@ class BfdResponder:
         self.source_macs = {
             name: get_if_hwaddr(name) for name in self.interface_names
         }
-        self.stop_event = threading.Event()
-        self.threads = [
-            threading.Thread(target=self._run, args=(name,), daemon=True)
-            for name in self.interface_names
-        ]
+        self.sniffers = []
 
     def start(self):
-        for thread in self.threads:
-            thread.start()
+        import functools
+
+        from scapy.all import AsyncSniffer
+
+        for interface_name in self.interface_names:
+            ready = threading.Event()
+            sniffer = AsyncSniffer(
+                iface=interface_name,
+                filter="udp dst port {} and src host {}".format(
+                    self.udp_port, self.local_ip
+                ),
+                store=False,
+                prn=functools.partial(self._respond, interface_name),
+                started_callback=ready.set,
+            )
+            sniffer.start()
+            self.sniffers.append(sniffer)
+
+            if not ready.wait(timeout=SNIFFER_START_TIMEOUT):
+                self.stop()
+                raise AssertionError(
+                    "BFD responder failed to start capture on {}".format(
+                        interface_name
+                    )
+                )
 
     def stop(self):
-        self.stop_event.set()
-        for thread in self.threads:
-            thread.join(timeout=2)
-
-    def _run(self, interface_name):
-        from scapy.all import sniff
-
-        while not self.stop_event.is_set():
-            sniff(
-                iface=interface_name,
-                filter="udp",
-                timeout=0.5,
-                store=False,
-                prn=lambda packet: self._respond(interface_name, packet),
-            )
+        for sniffer in self.sniffers:
+            try:
+                sniffer.stop()
+            except Exception:
+                # stop() raises if the sniffer never reached its run loop, which
+                # happens when start() aborts partway and unwinds through here.
+                pass
+        self.sniffers = []
 
     def _respond(self, interface_name, packet):
         from scapy.all import Ether, IP, UDP, sendp
