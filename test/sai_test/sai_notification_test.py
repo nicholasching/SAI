@@ -24,8 +24,12 @@ from sai_test_base import T0TestBase
 from sai_utils import sai_ipaddress, sai_ipprefix
 
 
-PORT_NOTIFICATION_TYPE = 0
-BFD_NOTIFICATION_TYPE = 1
+PORT_NOTIFICATION_TYPE = (
+    sai_thrift_notification_type_t.SAI_THRIFT_NOTIFICATION_TYPE_PORT_STATE_CHANGE
+)
+BFD_NOTIFICATION_TYPE = (
+    sai_thrift_notification_type_t.SAI_THRIFT_NOTIFICATION_TYPE_BFD_SESSION_STATE_CHANGE
+)
 NOTIFICATION_TEST_PARAM = "notification_test"
 NOTIFICATION_TEST_VALUE = "true"
 PLATFORM_PARAM = "platform"
