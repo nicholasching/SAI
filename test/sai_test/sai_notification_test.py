@@ -425,8 +425,6 @@ class BfdNotificationTestBase(NotificationTestBase):
         return output
 
     def assert_vpp_bfd_state(self, expected_state_word):
-        if self.platform != VPP_PLATFORM:
-            return
         output = self.log_vpp_state("show", "bfd", "sessions")
         self.assertIn(
             self.remote_ip,
@@ -438,6 +436,16 @@ class BfdNotificationTestBase(NotificationTestBase):
             r"(?i)\b{}\b".format(expected_state_word),
             "VPP did not report BFD state {}".format(expected_state_word),
         )
+
+    # A platform opts in to dataplane corroboration by adding its own entry.
+    PLATFORM_BFD_STATE_CHECKS = {
+        VPP_PLATFORM: assert_vpp_bfd_state,
+    }
+
+    def assert_platform_bfd_state(self, expected_state_word):
+        check = self.PLATFORM_BFD_STATE_CHECKS.get(self.platform)
+        if check is not None:
+            check(self, expected_state_word)
 
     def tearDown(self):
         try:
@@ -475,13 +483,13 @@ class BfdNotificationTestBase(NotificationTestBase):
         self.start_session()
         self.bfd_event(SAI_BFD_SESSION_STATE_UP)
         self.assert_bfd_state(SAI_BFD_SESSION_STATE_UP)
-        self.assert_vpp_bfd_state("up")
+        self.assert_platform_bfd_state("up")
 
     def break_path(self):
         self.stop_peer()
         self.bfd_event(SAI_BFD_SESSION_STATE_DOWN)
         self.assert_bfd_state(SAI_BFD_SESSION_STATE_DOWN)
-        self.assert_vpp_bfd_state("down")
+        self.assert_platform_bfd_state("down")
 
 
 class BfdSessionUpTest(BfdNotificationTestBase):
